@@ -1,0 +1,52 @@
+# Секреты и конфиг с ключами
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+.env/
+
+# База данных (создаётся при первом запуске)
+mochi.db
+*.db
+*.sqlite3
+
+# IDE / редактор
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи и кэш
+*.log
+.cache/
