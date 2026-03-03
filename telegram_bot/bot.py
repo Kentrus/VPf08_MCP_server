@@ -2,8 +2,10 @@
 
 import json
 import re
+import sys
 import logging
 from telegram import Update
+from telegram.error import Conflict, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
@@ -41,6 +43,36 @@ calculate - вычислить математическое выражение (
 Отвечай на русском языке, будь дружелюбным и полезным, описывай десерты вкусно и понятно.
 Важно: если нужен вызов инструмента — ответь ТОЛЬКО одним JSON-объектом без markdown и без лишнего текста. Если инструмент не нужен — ответь обычным текстом.
 """
+
+
+def _infer_tool_from_message(text: str):
+    """Если LLM не вернул JSON — по ключевым словам угадываем инструмент (fallback)."""
+    t = (text or "").lower().strip()
+    # покажи все моти / список моти / все десерты
+    if any(x in t for x in ("все моти", "список моти", "все десерты", "какие моти есть", "меню моти", "покажи моти")):
+        return "list_mochi", {}
+    # найди моти клубника / моти с клубникой
+    if "найди" in t or "найти" in t or "поиск" in t or "моти с " in t:
+        # Слово после "моти" или любое из известных
+        for kw in ("клубник", "манго", "кокос", "шоколад", "малин", "банан", "лимон", "фисташк", "тирамису", "орео"):
+            if kw in t:
+                return "find_mochi_by_name", {"name": kw}
+        parts = t.replace("найди", "").replace("найти", "").replace("моти", "").strip().split()
+        if parts:
+            return "find_mochi_by_name", {"name": parts[0]}
+    # что есть с X / с кокосом / по ингредиенту
+    if "с " in t or "ингредиент" in t or "что есть" in t:
+        for kw in ("кокос", "шоколад", "малин", "клубник", "банан", "орех", "мята", "кофе", "сливк"):
+            if kw in t:
+                return "find_mochi_by_ingredient", {"ingredient": kw}
+    # посчитай / вычисли / 3*150
+    if any(x in t for x in ("посчитай", "вычисли", "сколько будет", "посчитать")):
+        nums = re.findall(r"[\d+\-*/().\s]+", t)
+        if nums:
+            expr = "".join(nums).replace(" ", "").strip()
+            if expr and len(expr) > 1:
+                return "calculate", {"expression": expr}
+    return None, {}
 
 
 def _extract_json(text: str) -> dict | None:
@@ -115,6 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             temperature=0.3,
         )
         reply = (response.choices[0].message.content or "").strip()
+        logger.info("LLM reply (first 200 chars): %s", (reply or "")[:200])
     except Exception as e:
         logger.exception("OpenAI request failed")
         await update.message.reply_text(f"Не удалось получить ответ: {e}. Проверьте OPENAI_API_KEY и доступ к API.")
@@ -125,10 +158,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if isinstance(parsed, dict) and parsed.get("tool"):
         tool_name = parsed.get("tool", "").strip()
         arguments = parsed.get("arguments") or {}
+        logger.info("LLM chose tool=%s args=%s", tool_name, arguments)
+        result = call_mcp_tool(tool_name, arguments)
+        logger.info("MCP result: %s", result if not isinstance(result, list) else f"list[{len(result)}]")
+        formatted = _format_tool_result(tool_name, result)
+        try:
+            await update.message.reply_text(formatted, parse_mode="Markdown")
+        except BadRequest as e:
+            if "parse" in str(e).lower() or "markdown" in str(e).lower():
+                await update.message.reply_text(formatted)
+            else:
+                raise
+        return
+
+    # Если LLM не вернул JSON — пробуем по ключевым словам вызвать инструмент (fallback)
+    tool_name, arguments = _infer_tool_from_message(user_text)
+    if tool_name:
+        logger.info("Fallback: inferred tool=%s args=%s", tool_name, arguments)
         result = call_mcp_tool(tool_name, arguments)
         formatted = _format_tool_result(tool_name, result)
-        # Короткое пояснение от LLM не запрашиваем — сразу отвечаем результатом
-        await update.message.reply_text(formatted, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(formatted, parse_mode="Markdown")
+        except BadRequest:
+            await update.message.reply_text(formatted)
         return
 
     # Обычный текстовый ответ модели
@@ -147,13 +199,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик ошибок: Conflict — второй экземпляр бота."""
+    if isinstance(context.error, Conflict):
+        logger.error(
+            "Conflict: уже запущен другой экземпляр бота с этим токеном. "
+            "Остановите все процессы 'python bot.py' и через 20–30 сек запустите один."
+        )
+        sys.exit(1)
+    logger.exception("Exception while handling an update:", exc_info=context.error)
+
+
 def main() -> None:
     token = get_telegram_token()
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
     logger.info("Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
